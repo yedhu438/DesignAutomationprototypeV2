@@ -46,9 +46,9 @@ TEMP_FOLDER   = r"C:\Varsany\Temp"
 for _d in [UPLOAD_FOLDER, OUTPUT_FOLDER, FONTS_FOLDER, TEMP_FOLDER]:
     os.makedirs(_d, exist_ok=True)
 
-# LOW-RES MODE  — change back to 320 (812 DPI) when ready for production
-PX_PER_CM = 28                        # ≈72 DPI: canvas ~840px for 30cm zone
-DPI        = int(PX_PER_CM * 2.54)   # ~71
+# PRODUCTION MODE  — 320 PPI
+PX_PER_CM = 126                       # 320 PPI = 126 px/cm (320 / 2.54)
+DPI       = 320                       # 320 PPI as requested
 
 def cm_to_px(cm): return int(round(cm * PX_PER_CM))
 
@@ -98,6 +98,89 @@ def get_font(font_name, size_px):
     except: return ImageFont.load_default()
 
 
+# ─── IMAGE UPSCALING ──────────────────────────────────────────────────────────
+
+def upscale_image_smart(img_pil, scale=4, method="lanczos"):
+    """
+    Upscale image using specified method
+    Methods: lanczos, cubic, real-esrgan (if available)
+    """
+    if method == "real-esrgan":
+        try:
+            return upscale_real_esrgan(img_pil, scale)
+        except Exception as e:
+            print(f"Real-ESRGAN failed: {e}, falling back to Lanczos")
+            method = "lanczos"
+
+    # Lanczos (high-quality interpolation)
+    if method == "lanczos":
+        new_size = (img_pil.width * scale, img_pil.height * scale)
+        img_upscaled = img_pil.resize(new_size, Image.LANCZOS)
+        # Apply sharpening to reduce blur
+        from PIL import ImageFilter
+        img_upscaled = img_upscaled.filter(ImageFilter.SHARPEN)
+        return img_upscaled
+
+    # Cubic (faster, good quality)
+    elif method == "cubic":
+        import cv2
+        import numpy as np
+        img_array = np.array(img_pil)
+        new_size = (img_pil.width * scale, img_pil.height * scale)
+        img_upscaled = cv2.resize(img_array, new_size, interpolation=cv2.INTER_CUBIC)
+        return Image.fromarray(img_upscaled)
+
+    return img_pil
+
+
+def upscale_real_esrgan(img_pil, scale=4):
+    """
+    Upscale using Real-ESRGAN (if installed)
+    Falls back to Lanczos if not available
+    """
+    try:
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        import cv2
+        import numpy as np
+
+        # Initialize model (cached after first call)
+        if not hasattr(upscale_real_esrgan, 'upsampler'):
+            print("Loading Real-ESRGAN model...")
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                           num_block=23, num_grow_ch=32, scale=4)
+
+            upscale_real_esrgan.upsampler = RealESRGANer(
+                scale=4,
+                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',
+                model=model,
+                tile=400,  # Process in tiles for memory efficiency
+                tile_pad=10,
+                pre_pad=0,
+                half=False,  # Set True for GPU
+                gpu_id=None  # Auto-detect GPU, fallback to CPU
+            )
+            print("Real-ESRGAN model loaded!")
+
+        # Convert PIL to OpenCV format
+        img_array = np.array(img_pil.convert('RGB'))
+        img_cv2 = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+        # Upscale
+        output, _ = upscale_real_esrgan.upsampler.enhance(img_cv2, outscale=scale)
+
+        # Convert back to PIL
+        output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(output_rgb)
+
+    except ImportError:
+        print("Real-ESRGAN not installed. Install with: pip install realesrgan")
+        raise
+    except Exception as e:
+        print(f"Real-ESRGAN error: {e}")
+        raise
+
+
 def parse_texts(raw):
     if not raw: return []
     if "\n" in raw: return [t.strip() for t in raw.split("\n") if t.strip()]
@@ -127,23 +210,27 @@ def save_order_to_db(order_data):
         order_data["sku"], order_data["product"], "Unisex", "Prototype Customer")
 
     zone = order_data["zone"]
-    z    = zone.capitalize()
+    # Map zone names: pocket_left/pocket_right → Pocket for DB columns
+    zone_for_db = "Pocket" if zone in ["pocket", "pocket_left", "pocket_right"] else zone.capitalize()
+    # Store actual zone name in PrintLocation field
+    print_location = zone.replace("_", " ").title()  # "pocket_left" → "Pocket Left"
+
     sql = f"""
         INSERT INTO tblCustomOrderDetails
         (idCustomOrderDetails, idCustomOrder, PrintLocation,
          IsFrontLocation, IsBackLocation, IsSleeveLocation, IsPocketLocation,
-         {z}Image, {z}Text, {z}Fonts, {z}Colours,
+         {zone_for_db}Image, {zone_for_db}Text, {zone_for_db}Fonts, {zone_for_db}Colours,
          IsOrderProcess, IsDesignComplete,
          IsFrontPSDDownload, IsBackPSDDownload, IsSleevePSDDownload, IsPocketPSDDownload,
          DateAdd)
         VALUES (?,?,?, ?,?,?,?, ?,?,?,?, 0,0, 0,0,0,0, GETDATE())
     """
     cur.execute(sql,
-        did, oid, zone,
+        did, oid, print_location,
         1 if zone == "front"  else 0,
         1 if zone == "back"   else 0,
         1 if zone == "sleeve" else 0,
-        1 if zone == "pocket" else 0,
+        1 if zone in ["pocket", "pocket_left", "pocket_right"] else 0,
         os.path.basename(order_data.get("image_path", "")),
         (order_data["text"]   or "")[:500],
         (order_data["font"]   or "")[:100],
@@ -206,7 +293,11 @@ def get_recent_orders():
 
 def _pack_pascal_string(s: str) -> bytes:
     """Pascal string padded to 2-byte boundary — used in Image Resources."""
-    b = s.encode("latin-1")
+    try:
+        b = s.encode("latin-1")
+    except UnicodeEncodeError:
+        # Fallback to ASCII, replacing non-encodable characters
+        b = s.encode("ascii", errors="replace")
     data = bytes([len(b)]) + b
     if len(data) % 2 != 0:
         data += b'\x00'
@@ -219,7 +310,16 @@ def _pack_layer_name(s: str) -> bytes:
     PSD spec: "Layer name: Pascal string, padded to a multiple of 4 bytes."
     Image resources use 2-byte padding; layer names use 4-byte padding.
     """
-    b = s.encode("latin-1")
+    try:
+        b = s.encode("latin-1")
+    except UnicodeEncodeError:
+        # Fallback to ASCII, replacing non-encodable characters
+        b = s.encode("ascii", errors="replace")
+
+    # Truncate if too long (max 255 bytes for Pascal string)
+    if len(b) > 255:
+        b = b[:255]
+
     data = bytes([len(b)]) + b
     pad = (4 - len(data) % 4) % 4
     return data + b'\x00' * pad
@@ -255,7 +355,10 @@ def _pack_unicode_string(s: str) -> bytes:
 
 def _pack_ostype_key(key: str) -> bytes:
     """4-byte OSType key — must be exactly 4 ASCII chars."""
-    b = key.encode('latin-1')
+    try:
+        b = key.encode('latin-1')
+    except UnicodeEncodeError:
+        b = key.encode('ascii', errors='replace')
     assert len(b) == 4, f"OSType key must be 4 bytes: {key!r}"
     return b
 
@@ -269,10 +372,13 @@ def _pack_descriptor(class_id_str: str, items: list) -> bytes:
     # ALL descriptors begin with a Class Name (unicode string). For our purposes,
     # the class name is always empty (length 0 = 4 bytes of 0x00).
     buf.write(struct.pack('>I', 0))
-    
+
     # Class ID: if length is 4 exactly, write 4 char OSType (no length prefix!).
     # If length != 4, write uint32 length + UTF-8/Latin-1 string.
-    cid = class_id_str.encode('latin-1')
+    try:
+        cid = class_id_str.encode('latin-1')
+    except UnicodeEncodeError:
+        cid = class_id_str.encode('ascii', errors='replace')
     if len(cid) == 4:
         buf.write(cid)
     else:
@@ -283,7 +389,10 @@ def _pack_descriptor(class_id_str: str, items: list) -> bytes:
     buf.write(struct.pack('>I', len(items)))
     for key_str, type_tag, value_bytes in items:
         # Key ID: same length convention as class ID
-        kid = key_str.encode('latin-1')
+        try:
+            kid = key_str.encode('latin-1')
+        except UnicodeEncodeError:
+            kid = key_str.encode('ascii', errors='replace')
         if len(kid) == 4:
             buf.write(struct.pack('>I', 0))
             buf.write(kid)
@@ -291,7 +400,11 @@ def _pack_descriptor(class_id_str: str, items: list) -> bytes:
             buf.write(struct.pack('>I', len(kid)))
             buf.write(kid)
         # Type tag (exactly 4 bytes)
-        buf.write(type_tag.encode('latin-1')[:4].ljust(4, b'\x00'))
+        try:
+            tag_bytes = type_tag.encode('latin-1')[:4].ljust(4, b'\x00')
+        except UnicodeEncodeError:
+            tag_bytes = type_tag.encode('ascii', errors='replace')[:4].ljust(4, b'\x00')
+        buf.write(tag_bytes)
         buf.write(value_bytes)
     return buf.getvalue()
 
@@ -307,7 +420,10 @@ def _desc_double(val: float) -> bytes:
 
 def _desc_unit_float(unit_str: str, val: float) -> bytes:
     """UntF: 4-byte unit type + 8-byte double."""
-    unit = unit_str.encode('latin-1')[:4].ljust(4, b'\x00')
+    try:
+        unit = unit_str.encode('latin-1')[:4].ljust(4, b'\x00')
+    except UnicodeEncodeError:
+        unit = unit_str.encode('ascii', errors='replace')[:4].ljust(4, b'\x00')
     return unit + struct.pack('>d', val)
 
 def _desc_unicode_string(s: str) -> bytes:
@@ -316,7 +432,10 @@ def _desc_unicode_string(s: str) -> bytes:
 def _desc_enum(type_str: str, val_str: str) -> bytes:
     """enum: type ID (OSType) + value ID (OSType)."""
     def _enc(s):
-        b = s.encode('latin-1')
+        try:
+            b = s.encode('latin-1')
+        except UnicodeEncodeError:
+            b = s.encode('ascii', errors='replace')
         if len(b) == 4:
             return struct.pack('>I', 0) + b
         return struct.pack('>I', len(b)) + b
@@ -457,7 +576,11 @@ def _build_engine_data(text: str, font_name: str, font_size_pt: float, color_rgb
 \t>>
 >>
 """
-    return engine_data.encode('latin-1')
+    try:
+        return engine_data.encode('latin-1')
+    except UnicodeEncodeError:
+        # Fallback: replace non-latin-1 characters
+        return engine_data.encode('ascii', errors='replace')
 
 
 def _build_tysh_block(text: str, font_name: str, font_size_pt: float,
@@ -584,7 +707,11 @@ def _pack_tagged_block(key: str, data: bytes) -> bytes:
     """
     pad = (4 - len(data) % 4) % 4
     padded = data + b'\x00' * pad
-    return b'8BIM' + key.encode('latin-1')[:4].ljust(4, b'\x00') + struct.pack('>I', len(padded)) + padded
+    try:
+        key_bytes = key.encode('latin-1')[:4].ljust(4, b'\x00')
+    except UnicodeEncodeError:
+        key_bytes = key.encode('ascii', errors='replace')[:4].ljust(4, b'\x00')
+    return b'8BIM' + key_bytes + struct.pack('>I', len(padded)) + padded
 
 
 def _pil_to_channels(pil_img: Image.Image, mode: str) -> dict:
@@ -847,7 +974,7 @@ def _parse_colour(colours_raw):
         except: pass
     return s if s.startswith("#") else "#ffffff"
 
-def _build_zone_content(zone_name, w, h, img_path, img_pil, text_lines, font_name, colour_hex, remove_bg, log_fn):
+def _build_zone_content(zone_name, w, h, img_path, img_pil, text_lines, font_name, colour_hex, remove_bg, log_fn, upscale_method="lanczos"):
     layers = []
 
     # Check if we have an image first
@@ -856,6 +983,18 @@ def _build_zone_content(zone_name, w, h, img_path, img_pil, text_lines, font_nam
         src_img = img_pil.convert("RGBA")
     elif img_path and os.path.isfile(img_path):
         src_img = Image.open(img_path).convert("RGBA")
+
+    # Upscale image if it's too small (less than 25% of target size)
+    if src_img:
+        min_dimension = min(w, h) * 0.25
+        if src_img.width < min_dimension or src_img.height < min_dimension:
+            scale_needed = max(2, int(min_dimension / min(src_img.width, src_img.height)))
+            scale_needed = min(scale_needed, 4)  # Max 4x upscale
+            log_fn(f"  [{zone_name}] Upscaling image {scale_needed}x using {upscale_method} ({src_img.width}x{src_img.height} => {src_img.width*scale_needed}x{src_img.height*scale_needed})", "info")
+            try:
+                src_img = upscale_image_smart(src_img, scale=scale_needed, method=upscale_method)
+            except Exception as e:
+                log_fn(f"  [{zone_name}] Upscaling failed: {e}, using original", "warning")
 
     # Calculate text dimensions if we have text
     text_img = None
@@ -1056,10 +1195,28 @@ def _build_zones_from_order_data(order_data, spec, font_name, colour, remove_bg,
     zones = []
 
     # ── Parse all zone data from order ────────────────────────────────────────
-    front_text    = parse_texts(order_data.get("front_text", "") or order_data.get("text", "") or "")
-    back_text     = parse_texts(order_data.get("back_text", "") or "")
-    pocket_text   = parse_texts(order_data.get("pocket_text", "") or "")
-    sleeve_text   = parse_texts(order_data.get("sleeve_text", "") or "")
+    # For single-zone form submissions, "text" and "image_path" are generic —
+    # assign them only to the zone the user actually selected, not always "front".
+    _selected_zone    = order_data.get("zone", "front")
+    _generic_text     = order_data.get("text", "") or ""
+    _generic_img_path = order_data.get("image_path", "") or ""
+
+    def _zone_text(zone_key):
+        """Return generic text only if it belongs to this zone."""
+        match = (zone_key == _selected_zone) or (
+            zone_key == "pocket" and _selected_zone in ["pocket_left", "pocket_right"])
+        return _generic_text if match else ""
+
+    def _zone_img(zone_key):
+        """Return generic image path only if it belongs to this zone."""
+        match = (zone_key == _selected_zone) or (
+            zone_key == "pocket" and _selected_zone in ["pocket_left", "pocket_right"])
+        return _generic_img_path if match else ""
+
+    front_text    = parse_texts(order_data.get("front_text", "") or _zone_text("front"))
+    back_text     = parse_texts(order_data.get("back_text", "") or _zone_text("back"))
+    pocket_text   = parse_texts(order_data.get("pocket_text", "") or _zone_text("pocket"))
+    sleeve_text   = parse_texts(order_data.get("sleeve_text", "") or _zone_text("sleeve"))
 
     front_imgs    = _parse_image_json(order_data.get("front_image_json", ""))
     back_imgs     = _parse_image_json(order_data.get("back_image_json", ""))
@@ -1067,9 +1224,9 @@ def _build_zones_from_order_data(order_data, spec, font_name, colour, remove_bg,
     sleeve_imgs   = _parse_image_json(order_data.get("sleeve_image_json", ""))
 
     # Also check direct image paths (from prototype form upload)
-    front_path    = order_data.get("image_path", "") or ""
-    back_path     = order_data.get("back_image_path", "") or ""
-    pocket_path   = order_data.get("pocket_image_path", "") or ""
+    front_path    = order_data.get("image_path", "") if _selected_zone == "front" else ""
+    back_path     = order_data.get("back_image_path", "") or _zone_img("back")
+    pocket_path   = order_data.get("pocket_image_path", "") or _zone_img("pocket")
 
     def download(fname):
         if not fname:
@@ -1117,12 +1274,32 @@ def _build_zones_from_order_data(order_data, spec, font_name, colour, remove_bg,
         zones.append(make_zone("sleeve", "sleeve", text_lines=sleeve_text))
 
     # ── FALLBACK: prototype form (single zone) ────────────────────────────────
+    # Always create all three standard zones: FRONT, BACK, POCKET
+    # Only the selected zone will have content, others will be empty placeholders
     if not zones:
         zone_key = order_data.get("zone", "front")
         text_lines = parse_texts(order_data.get("text", "") or "")
         img_path = order_data.get("image_path", "") or ""
-        zones.append(make_zone(zone_key, zone_key, img_path=img_path, text_lines=text_lines))
-        log(f"Fallback: single zone [{zone_key}]", "info")
+
+        log(f"Single-zone order: creating all zones with content in [{zone_key.upper()}]", "info")
+
+        # Create all three zones in order: POCKET, BACK, FRONT
+        # Map pocket_left/pocket_right to just "pocket" for display
+        selected_zone = zone_key
+        if zone_key in ["pocket_left", "pocket_right"]:
+            selected_zone = "pocket"
+            display_label = zone_key.replace("_", " ").upper()
+        else:
+            display_label = zone_key.upper()
+
+        # Add zones in print order: POCKET, BACK, FRONT
+        for zone_name in ["pocket", "back", "front"]:
+            if zone_name == selected_zone:
+                # This is the zone with content
+                zones.append(make_zone(display_label, zone_name, img_path=img_path, text_lines=text_lines))
+            else:
+                # Empty placeholder zone
+                zones.append(make_zone(zone_name.upper(), zone_name, img_path="", text_lines=[]))
 
     return zones
 
@@ -1300,6 +1477,8 @@ tr:hover td{background:#1f1f1f}
               <option value="back">Back</option>
               <option value="sleeve">Sleeve</option>
               <option value="pocket">Pocket</option>
+              <option value="pocket_left">Pocket Left</option>
+              <option value="pocket_right">Pocket Right</option>
             </select>
           </div>
         </div>
@@ -1386,6 +1565,26 @@ tr:hover td{background:#1f1f1f}
         <div class="form-group">
           <label>Pocket Text</label>
           <textarea name="pocket_text" rows="2" placeholder="Pocket text (optional)"></textarea>
+        </div>
+
+        <h3 style="color:#fbbf24;font-size:14px;margin:20px 0 10px">POCKET LEFT Zone</h3>
+        <div class="form-group">
+          <label>Pocket Left Image</label>
+          <input type="file" name="pocket_left_image" accept="image/*">
+        </div>
+        <div class="form-group">
+          <label>Pocket Left Text</label>
+          <textarea name="pocket_left_text" rows="2" placeholder="Pocket left text (optional)"></textarea>
+        </div>
+
+        <h3 style="color:#fbbf24;font-size:14px;margin:20px 0 10px">POCKET RIGHT Zone</h3>
+        <div class="form-group">
+          <label>Pocket Right Image</label>
+          <input type="file" name="pocket_right_image" accept="image/*">
+        </div>
+        <div class="form-group">
+          <label>Pocket Right Text</label>
+          <textarea name="pocket_right_text" rows="2" placeholder="Pocket right text (optional)"></textarea>
         </div>
 
         <h3 style="color:#f472b6;font-size:14px;margin:20px 0 10px">SLEEVE Zone</h3>
@@ -1499,9 +1698,12 @@ function previewImage(input) {
 }
 function updateZones() {
   const zones = {
-    hoodie:['front','back','sleeve','pocket'], tshirt:['front','back','sleeve','pocket'],
-    kidstshirt:['front','back'], totebag:['front','back'],
-    slipper:['front'], babyvest:['front']
+    hoodie:['front','back','sleeve','pocket','pocket_left','pocket_right'],
+    tshirt:['front','back','sleeve','pocket','pocket_left','pocket_right'],
+    kidstshirt:['front','back'],
+    totebag:['front','back'],
+    slipper:['front'],
+    babyvest:['front']
   };
   const z = zones[document.getElementById('productSelect').value] || ['front'];
   document.getElementById('zoneSelect').innerHTML = z.map(v =>
@@ -1689,7 +1891,8 @@ def submit_multizone():
         spec = PRODUCT_CANVAS.get(product, PRODUCT_CANVAS["tshirt"])
         zones = []
 
-        zone_names = ["front", "back", "pocket", "sleeve"]
+        # Order zones left to right: pocket_left, pocket_right, pocket, back, front, sleeve
+        zone_names = ["pocket_left", "pocket_right", "pocket", "back", "front", "sleeve"]
         for zone_name in zone_names:
             # Check if this zone has content
             img_file = request.files.get(f"{zone_name}_image")
@@ -1712,11 +1915,15 @@ def submit_multizone():
                 img_file.save(img_path)
                 log(f"Uploaded {zone_name} image: {os.path.basename(img_path)}", "info")
 
-            # Get zone dimensions
-            zone_dims = spec.get(zone_name, spec.get("front"))
+            # Get zone dimensions - map pocket_left/pocket_right to pocket
+            zone_key = "pocket" if zone_name in ["pocket_left", "pocket_right"] else zone_name
+            zone_dims = spec.get(zone_key, spec.get("front"))
+
+            # Display name with proper formatting
+            display_name = zone_name.replace("_", " ").upper()
 
             zones.append({
-                "name": zone_name,
+                "name": display_name,
                 "w": zone_dims[0],
                 "h": zone_dims[1],
                 "img_path": img_path,
